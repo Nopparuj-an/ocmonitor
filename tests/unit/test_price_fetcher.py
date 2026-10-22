@@ -461,3 +461,44 @@ class TestMapModelsDevToLocal:
         
         assert "gpt-4-turbo" in result
         assert "openai/gpt-4-turbo" in result
+
+    def test_map_real_models_dev_shape(self):
+        """Test the real models.dev shape: providers at top level, cost.input/output/cache_*."""
+        payload = {
+            "anthropic": {
+                "id": "anthropic",
+                "models": {
+                    "claude-sonnet-4-5": {
+                        "id": "claude-sonnet-4-5",
+                        "cost": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75},
+                        "limit": {"context": 200000, "output": 64000},
+                    }
+                },
+            }
+        }
+
+        result = map_models_dev_to_local(payload)
+
+        assert result["anthropic/claude-sonnet-4-5"] == {
+            "input": 3.0,
+            "output": 15.0,
+            "cacheWrite": 3.75,
+            "cacheRead": 0.3,
+            "contextWindow": 200000,
+            "sessionQuota": 0.0,
+        }
+        assert result["claude-sonnet-4-5"]["input"] == 3.0
+
+    def test_map_bare_key_prefers_priced_first_party_provider(self):
+        """Test bare key collisions prefer priced entries, then first-party providers."""
+        payload = {
+            "reseller": {"models": {"gpt-5": {"cost": {"input": 9, "output": 9}}}},
+            "free-host": {"models": {"gpt-5": {"cost": {"input": 0, "output": 0}}}},
+            "openai": {"models": {"gpt-5": {"cost": {"input": 1.25, "output": 10}}}},
+        }
+
+        result = map_models_dev_to_local(payload)
+
+        assert result["gpt-5"]["input"] == 1.25
+        assert result["reseller/gpt-5"]["input"] == 9.0
+        assert result["free-host/gpt-5"]["input"] == 0.0
