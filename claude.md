@@ -77,9 +77,9 @@ models.json                    # AI model pricing data (per 1M tokens)
 
 ### Data Flow
 
-1. **File Loading** (`utils/file_utils.py:FileProcessor`):
-   - Loads OpenCode session JSON files from `~/.local/share/opencode/storage/message/`
-   - Each session contains multiple interaction files with token usage data
+1. **Data Loading** (`utils/data_loader.py` picks the source):
+   - **SQLite** (`utils/sqlite_utils.py:SQLiteProcessor`, preferred): reads `~/.local/share/opencode/opencode.db`. `_get_schema()` picks SQL fragments for the v1 schema (`session`/`message`/`part`), OpenCode v2 (`session_v2`/`session_message`, tool calls inline in `content[]`), or both merged. Upgraded databases keep the frozen v1 tables, so v1 rows win and v2 only adds newer messages
+   - **Legacy files** (`utils/file_utils.py:FileProcessor`): loads pre-v1.2.0 JSON files from `~/.local/share/opencode/storage/message/`
    - Extracts: provider_id, model_id, tokens (input/output/cache_read/cache_write), project_path, timestamps
 
 2. **Session Analysis** (`services/session_analyzer.py:SessionAnalyzer`):
