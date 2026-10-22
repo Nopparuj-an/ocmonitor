@@ -204,6 +204,8 @@ OpenCode v1.2.0+ uses SQLite database:
 ~/.local/share/opencode/opencode.db
 ```
 
+OpenCode v2 keeps the same database file but stores sessions in new tables (`session_v2` and `session_message`, with tool calls inline in each message). OpenCode Monitor 1.0.5+ detects the layout automatically. On a database upgraded from v1, the old tables are still read. OpenCode's v2 migration doesn't copy every older session's messages and rewrites their completion times, so this keeps pre-upgrade history and output-speed stats accurate.
+
 Legacy versions (< v1.2.0) use flat JSON files:
 ```
 ~/.local/share/opencode/storage/message/
@@ -438,7 +440,7 @@ Total tool calls: 1,620  1,560 succeeded  60 failed  Overall: 96%
 | `--format, -f` | Output format (`table`, `json`, `csv`) | `-f json` |
 
 **Notes:**
-- Requires SQLite database (OpenCode v1.2.0+). File-based storage is not supported for this command.
+- Requires SQLite database (OpenCode v1.2.0+, including v2). File-based storage is not supported for this command.
 - Success rate colors: green ≥90%, yellow ≥70%, red <70%
 - Output speed (p50) excludes tool-call-only interactions and interactions under 100 output tokens
 
@@ -574,7 +576,7 @@ OpenCode Monitor searches for configuration files in this order:
 
 ### Data Source Configuration
 
-OpenCode Monitor supports both SQLite database (OpenCode v1.2.0+) and legacy JSON files (< v1.2.0).
+OpenCode Monitor supports both SQLite database (OpenCode v1.2.0+, including the OpenCode v2 schema) and legacy JSON files (< v1.2.0). OpenCode v2 uses the same `opencode.db` file, so no path change is needed after upgrading.
 
 #### Method 1: Edit Configuration File
 
@@ -1991,6 +1993,25 @@ $EDITOR ~/.config/ocmonitor/config.toml
 ```
 
 **Note:** OpenCode v1.2.0+ stores sessions in SQLite at `~/.local/share/opencode/opencode.db`. The tool automatically detects and prefers SQLite when available, falling back to legacy files only when SQLite is not found.
+
+#### 10. No Recent Sessions After Upgrading to OpenCode v2
+
+**Problem:** Reports stop at the date you upgraded OpenCode to v2, and newer sessions are missing.
+
+**Cause:** OpenCode v2 writes new sessions to the `session_v2` and `session_message` tables. OpenCode Monitor versions before 1.0.5 only read the old `session` and `message` tables, which stop receiving data after the upgrade.
+
+**Solutions:**
+
+```bash
+# Check your installed version (1.0.5+ supports OpenCode v2)
+ocmonitor --version
+
+# Upgrade
+pipx upgrade opencode-monitor       # or: pip install --upgrade opencode-monitor
+
+# Confirm the database uses the v2 schema
+sqlite3 ~/.local/share/opencode/opencode.db ".tables" | grep session_v2
+```
 
 ### Debug Mode
 

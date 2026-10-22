@@ -6,7 +6,7 @@ Get up and running with OpenCode Monitor in just a few minutes!
 
 - Python 3.7 or higher
 - pip package manager
-- OpenCode session data (stored in `~/.local/share/opencode/storage/message/`)
+- OpenCode session data: the SQLite database at `~/.local/share/opencode/opencode.db` (OpenCode v1.2.0+ and v2), or JSON files in `~/.local/share/opencode/storage/message/` for older versions
 
 ## 🛠️ Installation
 

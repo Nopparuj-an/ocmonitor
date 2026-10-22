@@ -28,6 +28,7 @@ Transform your OpenCode usage data into beautiful, actionable insights with comp
 
 ### 🗄️ Storage Support
 - **SQLite Database** - Native support for OpenCode v1.2.0+ SQLite format (`~/.local/share/opencode/opencode.db`), including the OpenCode v2 schema (`session_v2` / `session_message`)
+- **OpenCode v2 Upgrades** - Databases upgraded to OpenCode v2 still show pre-upgrade history, including sessions OpenCode's migration did not copy to the new tables
 - **Legacy File Support** - Backwards compatible with pre-v1.2.0 JSON file storage
 - **Auto Detection** - Automatically detects and uses the appropriate storage backend
 - **Hierarchical Sessions** - Parent/sub-agent relationships from SQLite displayed as tree view
