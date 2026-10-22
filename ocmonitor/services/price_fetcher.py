@@ -289,6 +289,7 @@ def map_models_dev_to_local(payload: dict) -> Dict[str, Dict[str, Any]]:
     """
     result = {}
     bare_key_ranks: Dict[str, tuple] = {}
+    prefixed_keys: set = set()
 
     if not isinstance(payload, dict):
         return result
@@ -328,16 +329,22 @@ def map_models_dev_to_local(payload: dict) -> Dict[str, Dict[str, Any]]:
             provider_id_lower = provider_id.lower()
             model_id_lower = model_id.lower()
 
-            # Bare model ID (lowercase)
+            # Bare model ID (lowercase). Some model IDs contain "/" (e.g. an
+            # aggregator's "moonshotai/kimi-k3"), so a bare key can collide with
+            # another provider's prefixed key; the prefixed entry always wins.
             bare_key = model_id_lower
             rank = _bare_key_rank(provider_id_lower, pricing)
-            if bare_key not in bare_key_ranks or rank < bare_key_ranks[bare_key]:
+            if bare_key not in prefixed_keys and (
+                bare_key not in bare_key_ranks or rank < bare_key_ranks[bare_key]
+            ):
                 result[bare_key] = pricing.copy()
                 bare_key_ranks[bare_key] = rank
-            
+
             # Provider-prefixed model ID (lowercase)
             prefixed_key = f"{provider_id_lower}/{model_id_lower}"
-            if prefixed_key not in result:
+            if prefixed_key not in prefixed_keys:
                 result[prefixed_key] = pricing.copy()
+                prefixed_keys.add(prefixed_key)
+                bare_key_ranks.pop(prefixed_key, None)
     
     return result

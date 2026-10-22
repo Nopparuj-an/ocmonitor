@@ -502,3 +502,15 @@ class TestMapModelsDevToLocal:
         assert result["gpt-5"]["input"] == 1.25
         assert result["reseller/gpt-5"]["input"] == 9.0
         assert result["free-host/gpt-5"]["input"] == 0.0
+
+    def test_map_prefixed_key_wins_over_colliding_bare_key(self):
+        """Test a bare model ID containing "/" never overwrites a provider-prefixed key."""
+        prefixed = {"moonshotai": {"models": {"kimi-k3": {"cost": {"input": 3, "output": 15}}}}}
+        aggregator = {"nvidia": {"models": {"moonshotai/kimi-k3": {"cost": {"input": 9, "output": 9}}}}}
+
+        # Either iteration order must keep the first-party prefixed entry
+        for payload in ({**prefixed, **aggregator}, {**aggregator, **prefixed}):
+            result = map_models_dev_to_local(payload)
+            assert result["moonshotai/kimi-k3"]["input"] == 3.0
+            assert result["nvidia/moonshotai/kimi-k3"]["input"] == 9.0
+            assert result["kimi-k3"]["input"] == 3.0
