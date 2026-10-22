@@ -165,7 +165,13 @@ def get_remote_payload(
     """
     lock_path = cache_path.with_suffix('.lock')
     now = datetime.now(timezone.utc)
-    
+
+    # The lock file lives beside the cache, so its directory must exist first
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     with _cache_lock:
         # Try to load existing cache
         envelope = load_cached_payload(cache_path)
@@ -227,34 +233,71 @@ def get_remote_payload(
             release_lock(lock_path)
 
 
+# First-party providers win bare model-ID collisions (lower = preferred)
+_BARE_KEY_PROVIDER_PRIORITY = {
+    'openai': 0,
+    'anthropic': 0,
+    'google': 0,
+    'deepseek': 0,
+    'xai': 0,
+    'mistral': 0,
+    'moonshotai': 0,
+    'zai': 0,
+    'xiaomi': 0,
+    'alibaba': 0,
+    'minimax': 0,
+}
+_DEFAULT_BARE_KEY_PRIORITY = 10
+
+
+def _cost_value(cost: dict, *keys: str) -> float:
+    """Return the first non-null numeric cost among keys, else 0.0."""
+    for key in keys:
+        value = cost.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def _bare_key_rank(provider_id: str, pricing: Dict[str, Any]) -> tuple:
+    """Rank a candidate for a bare model key: priced entries first, then provider."""
+    is_free = not pricing['input'] and not pricing['output']
+    return (is_free, _BARE_KEY_PROVIDER_PRIORITY.get(provider_id, _DEFAULT_BARE_KEY_PRIORITY))
+
+
 def map_models_dev_to_local(payload: dict) -> Dict[str, Dict[str, Any]]:
     """Convert models.dev response to local pricing dict format.
-    
-    Maps remote fields to local pricing schema:
-    - cost.prompt -> input
-    - cost.completion -> output
-    - cost.input_cache_write -> cacheWrite
-    - cost.input_cache_read -> cacheRead
+
+    The models.dev API is a top-level dict keyed by provider ID, each with a
+    ``models`` dict. Maps remote fields to local pricing schema:
+    - cost.input -> input
+    - cost.output -> output
+    - cost.cache_write -> cacheWrite
+    - cost.cache_read -> cacheRead
     - limit.context -> contextWindow
     - sessionQuota is not provided, defaults to 0.0
-    
+
     Generates both bare model IDs and provider-prefixed IDs for compatibility.
-    
+    When several providers offer the same bare model ID, a priced entry from a
+    first-party provider is preferred.
+
     Args:
         payload: Raw models.dev API response
-        
+
     Returns:
         Dict mapping model names to pricing data dicts
     """
     result = {}
-    
+    bare_key_ranks: Dict[str, tuple] = {}
+
     if not isinstance(payload, dict):
         return result
-    
-    providers = payload.get('providers', {})
+
+    # Accept a legacy {"providers": {...}} wrapper as well as the real shape
+    providers = payload.get('providers')
     if not isinstance(providers, dict):
-        return result
-    
+        providers = payload
+
     for provider_id, provider_data in providers.items():
         if not isinstance(provider_data, dict):
             continue
@@ -273,22 +316,24 @@ def map_models_dev_to_local(payload: dict) -> Dict[str, Dict[str, Any]]:
             
             # Build pricing entry
             pricing = {
-                'input': cost.get('prompt', 0.0) or 0.0,
-                'output': cost.get('completion', 0.0) or 0.0,
-                'cacheWrite': cost.get('input_cache_write', 0.0) or 0.0,
-                'cacheRead': cost.get('input_cache_read', 0.0) or 0.0,
+                'input': _cost_value(cost, 'input', 'prompt'),
+                'output': _cost_value(cost, 'output', 'completion'),
+                'cacheWrite': _cost_value(cost, 'cache_write', 'input_cache_write'),
+                'cacheRead': _cost_value(cost, 'cache_read', 'input_cache_read'),
                 'contextWindow': limit.get('context', 0) or 0,
                 'sessionQuota': 0.0,  # Not provided by models.dev
             }
-            
+
             # Generate keys
             provider_id_lower = provider_id.lower()
             model_id_lower = model_id.lower()
-            
+
             # Bare model ID (lowercase)
             bare_key = model_id_lower
-            if bare_key not in result:
+            rank = _bare_key_rank(provider_id_lower, pricing)
+            if bare_key not in bare_key_ranks or rank < bare_key_ranks[bare_key]:
                 result[bare_key] = pricing.copy()
+                bare_key_ranks[bare_key] = rank
             
             # Provider-prefixed model ID (lowercase)
             prefixed_key = f"{provider_id_lower}/{model_id_lower}"

@@ -62,6 +62,12 @@ def get_exchange_rate(currency_config) -> Optional[Decimal]:
     lock_path = cache_path.with_suffix(".lock")
     now = datetime.now(timezone.utc)
 
+    # The lock file lives beside the cache, so its directory must exist first
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     # Normalize currency code to uppercase for lookup
     # (frankfurter.dev returns uppercase currency codes)
     currency_code = currency_config.code.upper()

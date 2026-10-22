@@ -357,7 +357,8 @@ class TestModelsConfigRemote:
         assert hasattr(config, 'remote_cache_path')
         assert ".cache/ocmonitor" in config.remote_cache_path
         assert hasattr(config, 'user_file')
-        assert config.user_file == "~/.config/ocmonitor/models.json"
+        assert config.user_file == os.path.expanduser("~/.config/ocmonitor/models.json")
+        assert "~" not in config.remote_cache_path
         assert hasattr(config, 'allow_stale_cache_on_error')
         assert config.allow_stale_cache_on_error is True
     
