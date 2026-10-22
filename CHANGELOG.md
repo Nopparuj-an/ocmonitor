@@ -71,6 +71,7 @@ OpenCode v2 moves sessions into `session_v2` and messages into `session_message`
 
 ### ✨ Improvements
 
+- Refresh bundled `models.json` from models.dev (2026-10-22): add 75 current models from OpenAI, Anthropic, Google, xAI, Meta, and open-weight labs (DeepSeek, Moonshot, Z.ai, Alibaba Qwen, MiniMax, Xiaomi, Mistral), correct 16 stale entries (e.g. `gpt-5`/`gpt-5.1`, `gpt-5-nano`, `gpt-5.4-pro` cache read, DeepSeek V4), and remove 24 models no longer served (GPT-5.x Codex, Claude Sonnet 4 / Opus 4.1 / Haiku 3.5, Gemini 3 Pro/Flash, Kimi K2/K2.5, `-extended` and mispriced `-free` variants). Pricing for retired models used through proxy providers is still available with `remote_fallback = true`
 - Add `--recalculate` flag to `session`, `sessions`, `daily`, `weekly`, and `monthly` commands to recalculate costs using current pricing instead of stored values
 - Add `--week`, `--month`, and `--year` bare flags for filtering recent periods (last 7 days, 30 days, 365 days respectively)
 - Add `--month` and `--year` parameters with `last_n_days` support to `weekly` and `monthly` commands
