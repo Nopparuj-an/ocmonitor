@@ -112,9 +112,11 @@ def test_tool_usage_by_model_v2(v2_db: Path):
 def test_model_queries_v2(v2_db: Path):
     assert SQLiteProcessor.find_matching_models("sonnet", v2_db) == ["claude-sonnet-5"]
 
-    stats = SQLiteProcessor.get_model_detail_stats("gpt-5.5", {}, v2_db)
-    assert stats.total_interactions == 1
-    assert stats.total_tokens.input == 50
+    # "GPT-5.5" and "gpt-5.5" are one model
+    assert SQLiteProcessor.find_matching_models("gpt", v2_db) == ["gpt-5.5"]
+    stats = SQLiteProcessor.get_model_detail_stats("GPT-5.5", {}, v2_db)
+    assert stats.total_interactions == 2
+    assert stats.total_tokens.input == 150
 
 
 def test_database_stats_v2(v2_db: Path):

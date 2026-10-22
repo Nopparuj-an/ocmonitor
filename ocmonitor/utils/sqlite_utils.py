@@ -970,7 +970,7 @@ class SQLiteProcessor:
             cursor = conn.execute(
                 f"""
                 SELECT DISTINCT
-                    COALESCE({schema['model']}, 'unknown') as model_name
+                    LOWER(COALESCE({schema['model']}, 'unknown')) as model_name
                 FROM {schema['message']} m
                 WHERE json_valid(m.data) = 1
                   AND {schema['is_assistant']}
@@ -1027,9 +1027,9 @@ class SQLiteProcessor:
                 FROM {schema['message']} m
                 WHERE json_valid(m.data) = 1
                   AND {schema['is_assistant']}
-                  AND {schema['model']} = ?
+                  AND LOWER({schema['model']}) = ?
                 """,
-                (model_name,),
+                (model_name.lower(),),
             ).fetchone()
 
             if not row or row["total_interactions"] == 0:
@@ -1091,9 +1091,9 @@ class SQLiteProcessor:
                 FROM {schema['message']} m
                 WHERE json_valid(m.data) = 1
                   AND {schema['is_assistant']}
-                  AND {schema['model']} = ?
+                  AND LOWER({schema['model']}) = ?
                 """,
-                (model_name,),
+                (model_name.lower(),),
             )
 
             interaction_rates = []
@@ -1132,11 +1132,11 @@ class SQLiteProcessor:
                   AND json_extract({data}, '$.type') = 'tool'
                   AND json_extract({data}, '{name_path}') IS NOT NULL
                   AND json_extract({data}, '$.state.status') IN ('completed', 'error')
-                  AND {schema['model']} = ?
+                  AND LOWER({schema['model']}) = ?
                 GROUP BY tool_name
                 ORDER BY total_calls DESC
                 """,
-                (model_name,),
+                (model_name.lower(),),
             )
 
             tool_stats = []
