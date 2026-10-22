@@ -27,7 +27,7 @@ Transform your OpenCode usage data into beautiful, actionable insights with comp
 - **🔗 Workflow Grouping** - Automatically groups main sessions with their sub-agent sessions (explore, etc.)
 
 ### 🗄️ Storage Support
-- **SQLite Database** - Native support for OpenCode v1.2.0+ SQLite format (`~/.local/share/opencode/opencode.db`)
+- **SQLite Database** - Native support for OpenCode v1.2.0+ SQLite format (`~/.local/share/opencode/opencode.db`), including the OpenCode v2 schema (`session_v2` / `session_message`)
 - **Legacy File Support** - Backwards compatible with pre-v1.2.0 JSON file storage
 - **Auto Detection** - Automatically detects and uses the appropriate storage backend
 - **Hierarchical Sessions** - Parent/sub-agent relationships from SQLite displayed as tree view

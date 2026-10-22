@@ -70,8 +70,9 @@ class ModelsConfig(BaseModel):
     remote_url: str = Field(default="https://models.dev/api.json")
     remote_timeout_seconds: int = Field(default=8, ge=1, le=60)
     remote_cache_ttl_hours: int = Field(default=24, ge=1, le=168)
-    remote_cache_path: str = Field(default=get_default_cache_path())
-    user_file: Optional[str] = Field(default="~/.config/ocmonitor/models.json")
+    # validate_default so "~" in the defaults is expanded too
+    remote_cache_path: str = Field(default=get_default_cache_path(), validate_default=True)
+    user_file: Optional[str] = Field(default="~/.config/ocmonitor/models.json", validate_default=True)
     allow_stale_cache_on_error: bool = Field(default=True)
 
     @field_validator('remote_cache_path', 'user_file')
@@ -107,7 +108,9 @@ class CurrencyConfig(BaseModel):
     remote_rates_url: str = Field(default="https://api.frankfurter.dev/v1/latest?base=USD")
     remote_rates_timeout_seconds: int = Field(default=8, ge=1, le=60)
     remote_rates_cache_ttl_hours: int = Field(default=24, ge=1, le=168)
-    remote_rates_cache_path: str = Field(default_factory=lambda: _default_rates_cache_path())
+    remote_rates_cache_path: str = Field(
+        default_factory=lambda: _default_rates_cache_path(), validate_default=True
+    )
     allow_stale_rates_on_error: bool = Field(default=True)
 
     @field_validator('remote_rates_cache_path')

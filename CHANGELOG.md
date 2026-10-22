@@ -46,9 +46,36 @@ Old bare-key `models.json` files continue to work without modification:
 - **Docstring coverage threshold** — increased docstring coverage to 92.4% (minimum 80%) by adding missing docstrings in touched source and test files
 
 
+### 🗄️ OpenCode v2 Schema Support
+
+OpenCode v2 moves sessions into `session_v2` and messages into `session_message`, with tool calls stored inline in each assistant message's `content` array. Earlier ocmonitor versions only read the legacy tables, which stop receiving data after the upgrade.
+
+#### Added
+- **Schema detection** in `SQLiteProcessor` — databases with a `session_v2` table are read using the v2 layout; v1 databases work unchanged
+- **Legacy tables are merged in** when an upgraded database still has them: the v2 migration skips some older sessions' messages and rewrites `time.completed` on the ones it copies, so the original v1 rows are used where they exist and v2 adds only the newer messages. This keeps pre-upgrade history and output-speed stats intact
+- v2 field mapping: role from the `type` column, model from `model.id`, provider from `model.providerID`, tool calls from `content[]` entries with `type: "tool"` and `name`
+- Project path falls back to the session `directory` when messages carry no `path` (always the case in v2)
+
+#### Fixed
+- **`ocmonitor live` shows sessions from providers that report no token usage** instead of falling back to an older workflow; reports still exclude them
+- **`--limit` counts sessions with usage data**, so `sessions --limit N` no longer returns nothing when the newest sessions have no token usage
+
+### 💲 models.dev Remote Pricing Fixes
+
+#### Fixed
+- **Remote pricing parsed nothing**: `map_models_dev_to_local()` expected a `providers` wrapper and `cost.prompt`/`cost.completion`; it now reads the real API shape (providers at the top level, `cost.input`/`output`/`cache_read`/`cache_write`)
+- **Default cache paths kept a literal `~`**: `remote_cache_path`, `user_file`, and `remote_rates_cache_path` defaults are now expanded
+- **First fetch always failed**: the cache directory is created before the lock file, so the initial download no longer times out after 30 seconds
+
+- **Provider-prefixed prices overwritten by aggregators**: a bare model ID containing `/` (e.g. an aggregator's `moonshotai/kimi-k3`) could replace the real provider's `provider/model` entry; prefixed entries now always win
+
+#### Changed
+- When several providers list the same bare model ID, a priced entry from a first-party provider now wins over the first one encountered
+- `ocmonitor model` matches model IDs case-insensitively, so `GPT-5.5` and `gpt-5.5` are reported as one model
 
 ### ✨ Improvements
 
+- Refresh bundled `models.json` from models.dev (2026-10-22): add 75 current models from OpenAI, Anthropic, Google, xAI, Meta, and open-weight labs (DeepSeek, Moonshot, Z.ai, Alibaba Qwen, MiniMax, Xiaomi, Mistral), correct 16 stale entries (e.g. `gpt-5`/`gpt-5.1`, `gpt-5-nano`, `gpt-5.4-pro` cache read, DeepSeek V4), and remove the mispriced `-free` entries, which charged paid prices for free models. Entries for retired models (GPT-5.x Codex, Claude Sonnet 4 / Opus 4.1 / Haiku 3.5, Gemini 3 Pro/Flash, Kimi K2/K2.5, `-extended` variants) are kept so historical sessions stay priced
 - Add `--recalculate` flag to `session`, `sessions`, `daily`, `weekly`, and `monthly` commands to recalculate costs using current pricing instead of stored values
 - Add `--week`, `--month`, and `--year` bare flags for filtering recent periods (last 7 days, 30 days, 365 days respectively)
 - Add `--month` and `--year` parameters with `last_n_days` support to `weekly` and `monthly` commands

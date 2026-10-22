@@ -550,7 +550,7 @@ class ReportGenerator:
 
         if len(matches) > 1:
             # Check for exact match first
-            exact = [m for m in matches if m == name]
+            exact = [m for m in matches if m == name.lower()]
             if len(exact) == 1:
                 matches = exact
             else:

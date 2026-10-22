@@ -1,4 +1,9 @@
-"""SQLite database utilities for OpenCode v1.2.0+ session storage."""
+"""SQLite database utilities for OpenCode v1.2.0+ session storage.
+
+Supports both the v1 schema (``session``/``message``/``part`` tables) and the
+OpenCode v2 schema (``session_v2``/``session_message`` tables, where tool calls
+live inline in each assistant message's ``content`` array).
+"""
 
 import json
 import sqlite3
@@ -13,6 +18,101 @@ from ..utils.file_utils import FileProcessor
 from ..models.session import SessionData, InteractionFile, TokenUsage, TimeData
 from ..models.tool_usage import ToolUsageStats, ToolUsageSummary, ModelToolUsage
 from ..models.analytics import ModelDetailStats
+
+
+# SQL fragments per schema version. Queries alias the message table as ``m``
+# and tool parts as ``p``. ``activity_message`` is the table that receives new
+# messages, used by the live-workflow recency queries. ``session_messages``
+# loads one session's messages and takes a ``:sid`` named parameter.
+_SCHEMA_V1: Dict[str, str] = {
+    "session": "session",
+    "message": "message",
+    "activity_message": "message",
+    "session_messages": (
+        "SELECT data, NULL AS role FROM message "
+        "WHERE session_id = :sid ORDER BY time_created"
+    ),
+    "is_assistant": "json_extract(m.data, '$.role') = 'assistant'",
+    "model": "COALESCE(json_extract(m.data, '$.modelID'), json_extract(m.data, '$.model.modelID'))",
+    "tool_from": "part p",
+    "tool_from_with_message": "part p JOIN message m ON p.message_id = m.id",
+    "tool_session": "p.session_id",
+    "tool_data": "p.data",
+    "tool_name_path": "$.tool",
+}
+
+_V2_TOOL_FROM = (
+    "session_message m, json_each("
+    "CASE WHEN json_valid(m.data) THEN m.data ELSE '{}' END, '$.content') p"
+)
+
+_SCHEMA_V2: Dict[str, str] = {
+    "session": "session_v2",
+    "message": "session_message",
+    "activity_message": "session_message",
+    "session_messages": (
+        "SELECT data, type AS role FROM session_message "
+        "WHERE session_id = :sid AND type = 'assistant' ORDER BY seq"
+    ),
+    "is_assistant": "m.type = 'assistant'",
+    "model": "json_extract(m.data, '$.model.id')",
+    "tool_from": _V2_TOOL_FROM,
+    "tool_from_with_message": _V2_TOOL_FROM,
+    "tool_session": "m.session_id",
+    "tool_data": "p.value",
+    "tool_name_path": "$.name",
+}
+
+# Upgraded databases keep the frozen v1 tables next to the v2 ones. The v2
+# migration skips some older sessions' messages and rewrites time.completed
+# on the ones it copies, so v1 rows win and v2 only adds messages v1 lacks.
+# v2 tool entries are reshaped to the v1 part layout ("name" -> "tool").
+_MERGED_MESSAGE = (
+    "(SELECT id, session_id, time_created, data,"
+    " CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END AS role"
+    " FROM message"
+    " UNION ALL"
+    " SELECT id, session_id, time_created, data, type AS role FROM session_message"
+    " WHERE id NOT IN (SELECT id FROM message))"
+)
+
+_MERGED_TOOL = (
+    "(SELECT session_id, message_id, data FROM part"
+    " UNION ALL"
+    " SELECT sm.session_id, sm.id,"
+    " CASE WHEN c.type = 'object'"
+    " THEN json_set(c.value, '$.tool', json_extract(c.value, '$.name')) END"
+    " FROM session_message sm, json_each("
+    "CASE WHEN json_valid(sm.data) THEN sm.data ELSE '{}' END, '$.content') c"
+    " WHERE sm.id NOT IN (SELECT id FROM message))"
+)
+
+_SCHEMA_V2_WITH_LEGACY: Dict[str, str] = {
+    "session": "session_v2",
+    "message": _MERGED_MESSAGE,
+    "activity_message": "session_message",
+    "session_messages": (
+        "SELECT data, role FROM ("
+        " SELECT data, NULL AS role, time_created FROM message"
+        " WHERE session_id = :sid"
+        " UNION ALL"
+        " SELECT data, type AS role, time_created FROM session_message"
+        " WHERE session_id = :sid AND type = 'assistant'"
+        " AND id NOT IN (SELECT id FROM message WHERE session_id = :sid)"
+        ") ORDER BY time_created"
+    ),
+    "is_assistant": "m.role = 'assistant'",
+    "model": (
+        "COALESCE(json_extract(m.data, '$.modelID'),"
+        " json_extract(m.data, '$.model.modelID'),"
+        " json_extract(m.data, '$.model.id'))"
+    ),
+    "tool_from": f"{_MERGED_TOOL} p",
+    "tool_from_with_message": f"{_MERGED_TOOL} p JOIN {_MERGED_MESSAGE} m ON p.message_id = m.id",
+    "tool_session": "p.session_id",
+    "tool_data": "p.data",
+    "tool_name_path": "$.tool",
+}
 
 
 class SQLiteProcessor:
@@ -78,16 +178,47 @@ class SQLiteProcessor:
         return conn
 
     @staticmethod
+    def _get_schema(conn: sqlite3.Connection) -> Dict[str, str]:
+        """Return SQL fragments for the schema version of this database.
+
+        OpenCode v2 migrates sessions into ``session_v2`` but leaves the legacy
+        tables in place. When both exist their messages are merged, because the
+        migration does not copy every session's messages.
+        """
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('session_v2', 'message', 'part')"
+            )
+        }
+        if "session_v2" not in tables:
+            return _SCHEMA_V1
+        if {"message", "part"} <= tables:
+            return _SCHEMA_V2_WITH_LEGACY
+        return _SCHEMA_V2
+
+    @staticmethod
     def _extract_model_name(model_data: Any) -> str:
         """Extract model name from various possible locations in message data."""
         if isinstance(model_data, dict):
             # Try modelID directly
             if "modelID" in model_data:
                 return model_data["modelID"] or "unknown"
-            # Try nested model.modelID
+            # Try nested model.modelID (v1) or model.id (v2)
             if "model" in model_data and isinstance(model_data["model"], dict):
-                return model_data["model"].get("modelID") or "unknown"
+                model = model_data["model"]
+                return model.get("modelID") or model.get("id") or "unknown"
         return "unknown"
+
+    @staticmethod
+    def _extract_provider_id(message_json: Dict[str, Any]) -> Optional[str]:
+        """Extract provider ID from top-level providerID (v1) or model.providerID (v2)."""
+        provider_id = message_json.get("providerID")
+        model = message_json.get("model")
+        if not provider_id and isinstance(model, dict):
+            provider_id = model.get("providerID")
+        return provider_id.lower() if provider_id else None
 
     @staticmethod
     def _extract_tokens(message_json: Dict[str, Any]) -> TokenUsage:
@@ -128,13 +259,14 @@ class SQLiteProcessor:
 
     @classmethod
     def parse_message_data(
-        cls, message_data_str: str, session_id: str
+        cls, message_data_str: str, session_id: str, role: Optional[str] = None
     ) -> Optional[InteractionFile]:
         """Parse a message data JSON string into an InteractionFile.
 
         Args:
             message_data_str: JSON string from message.data column
             session_id: ID of the session this message belongs to
+            role: Message role when stored outside the JSON (v2 ``type`` column)
 
         Returns:
             InteractionFile object or None if parsing failed
@@ -148,7 +280,7 @@ class SQLiteProcessor:
             return None
 
         # Only process assistant messages with tokens
-        role = data.get("role", "")
+        role = role or data.get("role", "")
         if role != "assistant":
             return None
 
@@ -157,7 +289,7 @@ class SQLiteProcessor:
         project_path = cls._extract_project_path(data)
         agent = cls._extract_agent(data)
         model_id = cls._extract_model_name(data).lower()
-        provider_id = (data.get("providerID") or "").lower() or None
+        provider_id = cls._extract_provider_id(data)
         finish_reason = data.get("finish")
 
         return InteractionFile(
@@ -187,13 +319,12 @@ class SQLiteProcessor:
             List of InteractionFile objects
         """
         cursor = conn.execute(
-            "SELECT data FROM message WHERE session_id = ? ORDER BY time_created",
-            (session_id,),
+            cls._get_schema(conn)["session_messages"], {"sid": session_id}
         )
 
         interactions = []
         for row in cursor:
-            interaction = cls.parse_message_data(row["data"], session_id)
+            interaction = cls.parse_message_data(row["data"], session_id, row["role"])
             if interaction:
                 interactions.append(interaction)
 
@@ -201,13 +332,18 @@ class SQLiteProcessor:
 
     @classmethod
     def load_session_data(
-        cls, conn: sqlite3.Connection, session_row: sqlite3.Row
+        cls,
+        conn: sqlite3.Connection,
+        session_row: sqlite3.Row,
+        include_zero_token: bool = False,
     ) -> Optional[SessionData]:
         """Load complete session data from a database row.
 
         Args:
             conn: Database connection
             session_row: Row from session table
+            include_zero_token: Keep interactions with no token usage (providers
+                that don't report usage), so the live view can still show them
 
         Returns:
             SessionData object or None if loading failed
@@ -218,10 +354,17 @@ class SQLiteProcessor:
         interaction_files = cls.load_session_messages(conn, session_id)
 
         # Filter out zero-token interactions (consistent with FileProcessor)
-        interaction_files = [f for f in interaction_files if f.tokens.total > 0]
+        if not include_zero_token:
+            interaction_files = [f for f in interaction_files if f.tokens.total > 0]
 
         if not interaction_files:
             return None
+
+        # v2 messages no longer carry path.cwd; fall back to the session directory
+        if "directory" in session_row.keys() and session_row["directory"]:
+            for f in interaction_files:
+                if not f.project_path:
+                    f.project_path = session_row["directory"]
 
         # Get agent from first interaction
         sorted_files = sorted(
@@ -268,24 +411,26 @@ class SQLiteProcessor:
 
         conn = cls._get_connection(db_path)
         try:
+            schema = cls._get_schema(conn)
             # Query all sessions with project info
-            query = """
+            query = f"""
                 SELECT s.*, p.worktree as project_path, p.name as project_name
-                FROM session s
+                FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
                 ORDER BY s.time_created DESC
             """
 
-            if limit:
-                query += f" LIMIT {limit}"
-
             cursor = conn.execute(query)
             sessions = []
 
+            # Apply limit after filtering so sessions without token data
+            # (e.g. providers that report no usage) don't consume the limit
             for row in cursor:
                 session_data = cls.load_session_data(conn, row)
                 if session_data:
                     sessions.append(session_data)
+                    if limit and len(sessions) >= limit:
+                        break
 
             return sessions
         finally:
@@ -361,9 +506,10 @@ class SQLiteProcessor:
 
         conn = cls._get_connection(db_path)
         try:
-            cursor = conn.execute("""
+            schema = cls._get_schema(conn)
+            cursor = conn.execute(f"""
                 SELECT s.*, p.worktree as project_path, p.name as project_name
-                FROM session s
+                FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
                 ORDER BY s.time_created DESC
             """)
@@ -411,9 +557,10 @@ class SQLiteProcessor:
         try:
             # Get recent parent sessions (no parent_id) and check which have messages
             # We check up to 10 recent parents to find one with actual data
-            parent_rows = conn.execute("""
+            schema = cls._get_schema(conn)
+            parent_rows = conn.execute(f"""
                 SELECT s.*, p.worktree as project_path, p.name as project_name
-                FROM session s
+                FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
                 WHERE s.parent_id IS NULL
                 ORDER BY s.time_created DESC
@@ -426,7 +573,9 @@ class SQLiteProcessor:
             # Try each parent until we find one with data
             main_session = None
             for parent_row in parent_rows:
-                session = cls.load_session_data(conn, parent_row)
+                session = cls.load_session_data(
+                    conn, parent_row, include_zero_token=True
+                )
                 if session and session.files:  # Has interactions
                     main_session = session
                     break
@@ -443,10 +592,11 @@ class SQLiteProcessor:
         cls, conn: sqlite3.Connection, main_session: SessionData
     ) -> Dict[str, Any]:
         """Build workflow payload with parent session and loaded sub-agents."""
+        schema = cls._get_schema(conn)
         sub_agent_rows = conn.execute(
-            """
+            f"""
             SELECT s.*, p.worktree as project_path, p.name as project_name
-            FROM session s
+            FROM {schema['session']} s
             LEFT JOIN project p ON s.project_id = p.id
             WHERE s.parent_id = ?
             ORDER BY s.time_created ASC
@@ -456,7 +606,7 @@ class SQLiteProcessor:
 
         sub_agents = []
         for row in sub_agent_rows:
-            sub_session = cls.load_session_data(conn, row)
+            sub_session = cls.load_session_data(conn, row, include_zero_token=True)
             if sub_session:
                 sub_agents.append(sub_session)
 
@@ -495,29 +645,30 @@ class SQLiteProcessor:
         Returns:
             List of workflow dictionaries for orphan sub-agent groups
         """
+        schema = cls._get_schema(conn)
         if loaded_parent_ids:
             placeholders = ",".join("?" * len(loaded_parent_ids))
             query = f"""
                 SELECT s.*, p.worktree as project_path, p.name as project_name
-                FROM session s
+                FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
                 WHERE s.parent_id IS NOT NULL
                 AND s.parent_id NOT IN ({placeholders})
                 AND EXISTS (
-                    SELECT 1 FROM message m
+                    SELECT 1 FROM {schema['activity_message']} m
                     WHERE m.session_id = s.id AND m.time_created > ?
                 )
                 ORDER BY s.time_created DESC
             """
             params = list(loaded_parent_ids) + [threshold_ms]
         else:
-            query = """
+            query = f"""
                 SELECT s.*, p.worktree as project_path, p.name as project_name
-                FROM session s
+                FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
                 WHERE s.parent_id IS NOT NULL
                 AND EXISTS (
-                    SELECT 1 FROM message m
+                    SELECT 1 FROM {schema['activity_message']} m
                     WHERE m.session_id = s.id AND m.time_created > ?
                 )
                 ORDER BY s.time_created DESC
@@ -528,7 +679,7 @@ class SQLiteProcessor:
 
         sub_agents_by_parent: Dict[str, List[SessionData]] = {}
         for row in sub_agent_rows:
-            sub_session = cls.load_session_data(conn, row)
+            sub_session = cls.load_session_data(conn, row, include_zero_token=True)
             if sub_session and sub_session.parent_id:
                 parent_id: str = sub_session.parent_id
                 if parent_id not in sub_agents_by_parent:
@@ -595,13 +746,14 @@ class SQLiteProcessor:
                 active_threshold_minutes * 60 * 1000
             )
 
+            schema = cls._get_schema(conn)
             parent_rows = conn.execute(
-                """
+                f"""
                 SELECT s.*, p.worktree as project_path, p.name as project_name,
                        MAX(m.time_created) as last_parent_message_time
-                FROM session s
+                FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
-                JOIN message m ON m.session_id = s.id
+                JOIN {schema['activity_message']} m ON m.session_id = s.id
                 WHERE s.parent_id IS NULL
                 GROUP BY s.id
                 HAVING last_parent_message_time > ?
@@ -615,7 +767,9 @@ class SQLiteProcessor:
             loaded_parent_ids = set()
 
             for parent_row in parent_rows:
-                session = cls.load_session_data(conn, parent_row)
+                session = cls.load_session_data(
+                    conn, parent_row, include_zero_token=True
+                )
                 if session and session.files:
                     loaded_parent_ids.add(session.session_id)
                     active_workflows.append(cls._build_workflow_dict(conn, session))
@@ -648,14 +802,15 @@ class SQLiteProcessor:
         conn = cls._get_connection(db_path)
         try:
             stats = {"exists": True, "path": str(db_path)}
+            schema = cls._get_schema(conn)
 
             # Get counts
             stats["session_count"] = conn.execute(
-                "SELECT COUNT(*) FROM session"
+                f"SELECT COUNT(*) FROM {schema['session']}"
             ).fetchone()[0]
 
             stats["message_count"] = conn.execute(
-                "SELECT COUNT(*) FROM message"
+                f"SELECT COUNT(*) FROM {schema['message']}"
             ).fetchone()[0]
 
             stats["project_count"] = conn.execute(
@@ -664,7 +819,7 @@ class SQLiteProcessor:
 
             # Get sub-agent count
             stats["sub_agent_count"] = conn.execute(
-                "SELECT COUNT(*) FROM session WHERE parent_id IS NOT NULL"
+                f"SELECT COUNT(*) FROM {schema['session']} WHERE parent_id IS NOT NULL"
             ).fetchone()[0]
 
             # Get file size
@@ -705,21 +860,24 @@ class SQLiteProcessor:
         try:
             # Build placeholders for IN clause
             placeholders = ','.join('?' * len(session_ids))
-            
+            schema = cls._get_schema(conn)
+            data = schema['tool_data']
+            name_path = schema['tool_name_path']
+
             # Query tool parts with terminal statuses
             # Use json_valid to protect against malformed JSON
             # Use json_extract to access nested fields in the data column
             query = f"""
-                SELECT 
-                    json_extract(data, '$.tool') as tool_name,
-                    json_extract(data, '$.state.status') as status,
+                SELECT
+                    json_extract({data}, '{name_path}') as tool_name,
+                    json_extract({data}, '$.state.status') as status,
                     COUNT(*) as count
-                FROM part
-                WHERE session_id IN ({placeholders})
-                  AND json_valid(data) = 1
-                  AND json_extract(data, '$.type') = 'tool'
-                  AND json_extract(data, '$.tool') IS NOT NULL
-                  AND json_extract(data, '$.state.status') IN ('completed', 'error')
+                FROM {schema['tool_from']}
+                WHERE {schema['tool_session']} IN ({placeholders})
+                  AND json_valid({data}) = 1
+                  AND json_extract({data}, '$.type') = 'tool'
+                  AND json_extract({data}, '{name_path}') IS NOT NULL
+                  AND json_extract({data}, '$.state.status') IN ('completed', 'error')
                 GROUP BY tool_name, status
             """
             
@@ -788,25 +946,23 @@ class SQLiteProcessor:
         conn = cls._get_connection(db_path)
         try:
             placeholders = ','.join('?' * len(session_ids))
-            
+            schema = cls._get_schema(conn)
+            data = schema['tool_data']
+            name_path = schema['tool_name_path']
+
             query = f"""
-                SELECT 
-                    COALESCE(
-                        json_extract(m.data, '$.modelID'),
-                        json_extract(m.data, '$.model.modelID'),
-                        'unknown'
-                    ) as model_id,
-                    json_extract(p.data, '$.tool') as tool_name,
-                    json_extract(p.data, '$.state.status') as status,
+                SELECT
+                    LOWER(COALESCE({schema['model']}, 'unknown')) as model_id,
+                    json_extract({data}, '{name_path}') as tool_name,
+                    json_extract({data}, '$.state.status') as status,
                     COUNT(*) as count
-                FROM part p
-                JOIN message m ON p.message_id = m.id
-                WHERE p.session_id IN ({placeholders})
-                  AND json_valid(p.data) = 1
+                FROM {schema['tool_from_with_message']}
+                WHERE {schema['tool_session']} IN ({placeholders})
+                  AND json_valid({data}) = 1
                   AND json_valid(m.data) = 1
-                  AND json_extract(p.data, '$.type') = 'tool'
-                  AND json_extract(p.data, '$.tool') IS NOT NULL
-                  AND json_extract(p.data, '$.state.status') IN ('completed', 'error')
+                  AND json_extract({data}, '$.type') = 'tool'
+                  AND json_extract({data}, '{name_path}') IS NOT NULL
+                  AND json_extract({data}, '$.state.status') IN ('completed', 'error')
                 GROUP BY model_id, tool_name, status
             """
             
@@ -873,22 +1029,15 @@ class SQLiteProcessor:
 
         conn = cls._get_connection(db_path)
         try:
+            schema = cls._get_schema(conn)
             cursor = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT
-                    COALESCE(
-                        json_extract(m.data, '$.modelID'),
-                        json_extract(m.data, '$.model.modelID'),
-                        'unknown'
-                    ) as model_name
-                FROM message m
+                    LOWER(COALESCE({schema['model']}, 'unknown')) as model_name
+                FROM {schema['message']} m
                 WHERE json_valid(m.data) = 1
-                  AND json_extract(m.data, '$.role') = 'assistant'
-                  AND LOWER(COALESCE(
-                        json_extract(m.data, '$.modelID'),
-                        json_extract(m.data, '$.model.modelID'),
-                        'unknown'
-                  )) LIKE ?
+                  AND {schema['is_assistant']}
+                  AND LOWER(COALESCE({schema['model']}, 'unknown')) LIKE ?
                 ORDER BY model_name
                 """,
                 (f"%{query.lower()}%",),
@@ -919,9 +1068,10 @@ class SQLiteProcessor:
 
         conn = cls._get_connection(db_path)
         try:
+            schema = cls._get_schema(conn)
             # Query 1: Basic aggregate stats
             row = conn.execute(
-                """
+                f"""
                 SELECT
                     MIN(json_extract(m.data, '$.time.created')) as first_used,
                     MAX(COALESCE(
@@ -937,15 +1087,12 @@ class SQLiteProcessor:
                     SUM(MAX(0, COALESCE(json_extract(m.data, '$.tokens.output'), 0))) as output_tokens,
                     SUM(MAX(0, COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0))) as cache_read,
                     SUM(MAX(0, COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0))) as cache_write
-                FROM message m
+                FROM {schema['message']} m
                 WHERE json_valid(m.data) = 1
-                  AND json_extract(m.data, '$.role') = 'assistant'
-                  AND COALESCE(
-                        json_extract(m.data, '$.modelID'),
-                        json_extract(m.data, '$.model.modelID')
-                  ) = ?
+                  AND {schema['is_assistant']}
+                  AND LOWER({schema['model']}) = ?
                 """,
-                (model_name,),
+                (model_name.lower(),),
             ).fetchone()
 
             if not row or row["total_interactions"] == 0:
@@ -998,21 +1145,18 @@ class SQLiteProcessor:
 
             # Query 2: Per-interaction output rates for p50 calculation
             rate_cursor = conn.execute(
-                """
+                f"""
                 SELECT
                     COALESCE(json_extract(m.data, '$.tokens.output'), 0) as output_tokens,
                     json_extract(m.data, '$.time.created') as created,
                     json_extract(m.data, '$.time.completed') as completed,
                     json_extract(m.data, '$.finish') as finish_reason
-                FROM message m
+                FROM {schema['message']} m
                 WHERE json_valid(m.data) = 1
-                  AND json_extract(m.data, '$.role') = 'assistant'
-                  AND COALESCE(
-                        json_extract(m.data, '$.modelID'),
-                        json_extract(m.data, '$.model.modelID')
-                  ) = ?
+                  AND {schema['is_assistant']}
+                  AND LOWER({schema['model']}) = ?
                 """,
-                (model_name,),
+                (model_name.lower(),),
             )
 
             interaction_rates = []
@@ -1034,30 +1178,28 @@ class SQLiteProcessor:
                 interaction_rates.append(rate)
 
             # Query 3: Tool usage stats
+            data = schema['tool_data']
+            name_path = schema['tool_name_path']
             tool_cursor = conn.execute(
-                """
+                f"""
                 SELECT
-                    json_extract(p.data, '$.tool') as tool_name,
+                    json_extract({data}, '{name_path}') as tool_name,
                     COUNT(*) as total_calls,
-                    SUM(CASE WHEN json_extract(p.data, '$.state.status') = 'completed'
+                    SUM(CASE WHEN json_extract({data}, '$.state.status') = 'completed'
                         THEN 1 ELSE 0 END) as success,
-                    SUM(CASE WHEN json_extract(p.data, '$.state.status') = 'error'
+                    SUM(CASE WHEN json_extract({data}, '$.state.status') = 'error'
                         THEN 1 ELSE 0 END) as failed
-                FROM part p
-                JOIN message m ON p.message_id = m.id
-                WHERE json_valid(p.data) = 1
+                FROM {schema['tool_from_with_message']}
+                WHERE json_valid({data}) = 1
                   AND json_valid(m.data) = 1
-                  AND json_extract(p.data, '$.type') = 'tool'
-                  AND json_extract(p.data, '$.tool') IS NOT NULL
-                  AND json_extract(p.data, '$.state.status') IN ('completed', 'error')
-                  AND COALESCE(
-                        json_extract(m.data, '$.modelID'),
-                        json_extract(m.data, '$.model.modelID')
-                  ) = ?
+                  AND json_extract({data}, '$.type') = 'tool'
+                  AND json_extract({data}, '{name_path}') IS NOT NULL
+                  AND json_extract({data}, '$.state.status') IN ('completed', 'error')
+                  AND LOWER({schema['model']}) = ?
                 GROUP BY tool_name
                 ORDER BY total_calls DESC
                 """,
-                (model_name,),
+                (model_name.lower(),),
             )
 
             tool_stats = []
