@@ -21,10 +21,17 @@ from ..models.analytics import ModelDetailStats
 
 
 # SQL fragments per schema version. Queries alias the message table as ``m``
-# and tool parts as ``p``.
+# and tool parts as ``p``. ``activity_message`` is the table that receives new
+# messages, used by the live-workflow recency queries. ``session_messages``
+# loads one session's messages and takes a ``:sid`` named parameter.
 _SCHEMA_V1: Dict[str, str] = {
     "session": "session",
     "message": "message",
+    "activity_message": "message",
+    "session_messages": (
+        "SELECT data, NULL AS role FROM message "
+        "WHERE session_id = :sid ORDER BY time_created"
+    ),
     "is_assistant": "json_extract(m.data, '$.role') = 'assistant'",
     "model": "COALESCE(json_extract(m.data, '$.modelID'), json_extract(m.data, '$.model.modelID'))",
     "tool_from": "part p",
@@ -42,6 +49,11 @@ _V2_TOOL_FROM = (
 _SCHEMA_V2: Dict[str, str] = {
     "session": "session_v2",
     "message": "session_message",
+    "activity_message": "session_message",
+    "session_messages": (
+        "SELECT data, type AS role FROM session_message "
+        "WHERE session_id = :sid AND type = 'assistant' ORDER BY seq"
+    ),
     "is_assistant": "m.type = 'assistant'",
     "model": "json_extract(m.data, '$.model.id')",
     "tool_from": _V2_TOOL_FROM,
@@ -49,6 +61,57 @@ _SCHEMA_V2: Dict[str, str] = {
     "tool_session": "m.session_id",
     "tool_data": "p.value",
     "tool_name_path": "$.name",
+}
+
+# Upgraded databases keep the frozen v1 tables next to the v2 ones. The v2
+# migration skips some older sessions' messages and rewrites time.completed
+# on the ones it copies, so v1 rows win and v2 only adds messages v1 lacks.
+# v2 tool entries are reshaped to the v1 part layout ("name" -> "tool").
+_MERGED_MESSAGE = (
+    "(SELECT id, session_id, time_created, data,"
+    " CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END AS role"
+    " FROM message"
+    " UNION ALL"
+    " SELECT id, session_id, time_created, data, type AS role FROM session_message"
+    " WHERE id NOT IN (SELECT id FROM message))"
+)
+
+_MERGED_TOOL = (
+    "(SELECT session_id, message_id, data FROM part"
+    " UNION ALL"
+    " SELECT sm.session_id, sm.id,"
+    " CASE WHEN c.type = 'object'"
+    " THEN json_set(c.value, '$.tool', json_extract(c.value, '$.name')) END"
+    " FROM session_message sm, json_each("
+    "CASE WHEN json_valid(sm.data) THEN sm.data ELSE '{}' END, '$.content') c"
+    " WHERE sm.id NOT IN (SELECT id FROM message))"
+)
+
+_SCHEMA_V2_WITH_LEGACY: Dict[str, str] = {
+    "session": "session_v2",
+    "message": _MERGED_MESSAGE,
+    "activity_message": "session_message",
+    "session_messages": (
+        "SELECT data, role FROM ("
+        " SELECT data, NULL AS role, time_created FROM message"
+        " WHERE session_id = :sid"
+        " UNION ALL"
+        " SELECT data, type AS role, time_created FROM session_message"
+        " WHERE session_id = :sid AND type = 'assistant'"
+        " AND id NOT IN (SELECT id FROM message WHERE session_id = :sid)"
+        ") ORDER BY time_created"
+    ),
+    "is_assistant": "m.role = 'assistant'",
+    "model": (
+        "COALESCE(json_extract(m.data, '$.modelID'),"
+        " json_extract(m.data, '$.model.modelID'),"
+        " json_extract(m.data, '$.model.id'))"
+    ),
+    "tool_from": f"{_MERGED_TOOL} p",
+    "tool_from_with_message": f"{_MERGED_TOOL} p JOIN {_MERGED_MESSAGE} m ON p.message_id = m.id",
+    "tool_session": "p.session_id",
+    "tool_data": "p.data",
+    "tool_name_path": "$.tool",
 }
 
 
@@ -118,13 +181,22 @@ class SQLiteProcessor:
     def _get_schema(conn: sqlite3.Connection) -> Dict[str, str]:
         """Return SQL fragments for the schema version of this database.
 
-        OpenCode v2 migrates all sessions into ``session_v2`` but leaves the
-        legacy tables in place, so the presence of ``session_v2`` decides.
+        OpenCode v2 migrates sessions into ``session_v2`` but leaves the legacy
+        tables in place. When both exist their messages are merged, because the
+        migration does not copy every session's messages.
         """
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_v2'"
-        ).fetchone()
-        return _SCHEMA_V2 if row else _SCHEMA_V1
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('session_v2', 'message', 'part')"
+            )
+        }
+        if "session_v2" not in tables:
+            return _SCHEMA_V1
+        if {"message", "part"} <= tables:
+            return _SCHEMA_V2_WITH_LEGACY
+        return _SCHEMA_V2
 
     @staticmethod
     def _extract_model_name(model_data: Any) -> str:
@@ -246,18 +318,9 @@ class SQLiteProcessor:
         Returns:
             List of InteractionFile objects
         """
-        if cls._get_schema(conn) is _SCHEMA_V2:
-            cursor = conn.execute(
-                "SELECT data, type AS role FROM session_message "
-                "WHERE session_id = ? AND type = 'assistant' ORDER BY seq",
-                (session_id,),
-            )
-        else:
-            cursor = conn.execute(
-                "SELECT data, NULL AS role FROM message "
-                "WHERE session_id = ? ORDER BY time_created",
-                (session_id,),
-            )
+        cursor = conn.execute(
+            cls._get_schema(conn)["session_messages"], {"sid": session_id}
+        )
 
         interactions = []
         for row in cursor:
@@ -592,7 +655,7 @@ class SQLiteProcessor:
                 WHERE s.parent_id IS NOT NULL
                 AND s.parent_id NOT IN ({placeholders})
                 AND EXISTS (
-                    SELECT 1 FROM {schema['message']} m
+                    SELECT 1 FROM {schema['activity_message']} m
                     WHERE m.session_id = s.id AND m.time_created > ?
                 )
                 ORDER BY s.time_created DESC
@@ -605,7 +668,7 @@ class SQLiteProcessor:
                 LEFT JOIN project p ON s.project_id = p.id
                 WHERE s.parent_id IS NOT NULL
                 AND EXISTS (
-                    SELECT 1 FROM {schema['message']} m
+                    SELECT 1 FROM {schema['activity_message']} m
                     WHERE m.session_id = s.id AND m.time_created > ?
                 )
                 ORDER BY s.time_created DESC
@@ -690,7 +753,7 @@ class SQLiteProcessor:
                        MAX(m.time_created) as last_parent_message_time
                 FROM {schema['session']} s
                 LEFT JOIN project p ON s.project_id = p.id
-                JOIN {schema['message']} m ON m.session_id = s.id
+                JOIN {schema['activity_message']} m ON m.session_id = s.id
                 WHERE s.parent_id IS NULL
                 GROUP BY s.id
                 HAVING last_parent_message_time > ?

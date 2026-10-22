@@ -170,3 +170,134 @@ def test_live_workflows_keep_sessions_without_token_usage(tmp_path: Path):
     assert workflow["main_session"].session_id == "ses_z"
     assert len(SQLiteProcessor.get_all_active_workflows(db_path)) == 1
     assert SQLiteProcessor.load_all_sessions(db_path) == []
+
+
+def _v1_assistant(model_id, tokens_in, created=1000):
+    return json.dumps({
+        "role": "assistant",
+        "modelID": model_id,
+        "providerID": "anthropic",
+        "time": {"created": created, "completed": created + 500},
+        "path": {"cwd": "/work/myproj"},
+        "cost": 0.0,
+        "tokens": {"input": tokens_in, "output": 10, "reasoning": 0,
+                   "cache": {"read": 0, "write": 0}},
+    })
+
+
+@pytest.fixture
+def upgraded_db(tmp_path: Path) -> Path:
+    """A v2 database that still has the frozen v1 tables.
+
+    ses_old was migrated without its messages, so they exist only in v1.
+    ses_new has m1 in both (v2 copy has a rewritten completed time and the
+    same tool call inline) and m2 only in v2.
+    """
+    db_path = tmp_path / "opencode.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+            directory TEXT NOT NULL, title TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+            directory TEXT NOT NULL, title TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+    """)
+    conn.execute("INSERT INTO project VALUES ('p1', '/work/myproj', 'myproj')")
+    for table in ("session", "session_v2"):
+        conn.execute(
+            f"INSERT INTO {table} VALUES ('ses_old', 'p1', NULL, '/work/myproj', 'Old', 1000, 2000)"
+        )
+        conn.execute(
+            f"INSERT INTO {table} VALUES ('ses_new', 'p1', NULL, '/work/myproj', 'New', 3000, 4000)"
+        )
+
+    conn.execute(
+        "INSERT INTO message VALUES ('o1', 'ses_old', 1000, 1000, ?)",
+        (_v1_assistant("claude-sonnet-4", 100, created=1000),),
+    )
+    conn.execute(
+        "INSERT INTO message VALUES ('m1', 'ses_new', 3000, 3000, ?)",
+        (_v1_assistant("claude-sonnet-4", 200, created=3000),),
+    )
+    for pid, mid, sid, tool in (("t1", "o1", "ses_old", "edit"), ("t2", "m1", "ses_new", "shell")):
+        conn.execute(
+            "INSERT INTO part VALUES (?, ?, ?, 1000, 1000, ?)",
+            (pid, mid, sid, json.dumps(
+                {"type": "tool", "tool": tool, "state": {"status": "completed"}}
+            )),
+        )
+
+    migrated = json.loads(_assistant(
+        "claude-sonnet-4", "anthropic", 200, tools=[("shell", "completed")], created=3000
+    ))
+    migrated["time"]["completed"] = 9_999_999
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m1', 'ses_new', 'assistant', 1, 3000, 3000, ?)",
+        (json.dumps(migrated),),
+    )
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m2', 'ses_new', 'assistant', 2, 3500, 3500, ?)",
+        (_assistant("gpt-5.5", "openai", 50, tools=[("read", "completed")], created=3500),),
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_upgraded_db_keeps_v1_only_sessions(upgraded_db: Path):
+    sessions = {s.session_id: s for s in SQLiteProcessor.load_all_sessions(upgraded_db)}
+
+    assert set(sessions) == {"ses_old", "ses_new"}
+    assert [f.tokens.input for f in sessions["ses_old"].files] == [100]
+    assert [f.tokens.input for f in sessions["ses_new"].files] == [200, 50]
+
+
+def test_upgraded_db_prefers_v1_copy_of_migrated_messages(upgraded_db: Path):
+    sessions = {s.session_id: s for s in SQLiteProcessor.load_all_sessions(upgraded_db)}
+
+    migrated = sessions["ses_new"].files[0]
+    assert migrated.time_data.completed == 3500
+
+
+def test_upgraded_db_counts_each_tool_call_once(upgraded_db: Path):
+    stats = {s.tool_name: s.total_calls for s in
+             SQLiteProcessor.load_tool_usage_for_sessions(["ses_old", "ses_new"], upgraded_db)}
+
+    assert stats == {"edit": 1, "shell": 1, "read": 1}
+
+    by_model = {m.model_name: m.total_calls for m in
+                SQLiteProcessor.load_tool_usage_by_model_for_sessions(["ses_new"], upgraded_db)}
+    assert by_model == {"claude-sonnet-4": 1, "gpt-5.5": 1}
+
+
+def test_upgraded_db_model_queries_and_stats(upgraded_db: Path):
+    assert SQLiteProcessor.find_matching_models("", upgraded_db) == ["claude-sonnet-4", "gpt-5.5"]
+
+    stats = SQLiteProcessor.get_model_detail_stats("claude-sonnet-4", {}, upgraded_db)
+    assert stats.total_interactions == 2
+    assert stats.total_tokens.input == 300
+
+    db_stats = SQLiteProcessor.get_database_stats(upgraded_db)
+    assert db_stats["session_count"] == 2
+    assert db_stats["message_count"] == 3
