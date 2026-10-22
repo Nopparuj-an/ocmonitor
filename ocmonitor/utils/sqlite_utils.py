@@ -952,7 +952,7 @@ class SQLiteProcessor:
 
             query = f"""
                 SELECT
-                    COALESCE({schema['model']}, 'unknown') as model_id,
+                    LOWER(COALESCE({schema['model']}, 'unknown')) as model_id,
                     json_extract({data}, '{name_path}') as tool_name,
                     json_extract({data}, '$.state.status') as status,
                     COUNT(*) as count

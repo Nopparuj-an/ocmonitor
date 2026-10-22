@@ -105,8 +105,9 @@ def test_tool_usage_by_model_v2(v2_db: Path):
     result = {m.model_name: m for m in
               SQLiteProcessor.load_tool_usage_by_model_for_sessions(["ses_a"], v2_db)}
 
-    assert set(result) == {"GPT-5.5", "claude-sonnet-5"}
-    assert result["GPT-5.5"].total_calls == 2
+    # Model IDs are lowercased, matching how sessions store them
+    assert set(result) == {"gpt-5.5", "claude-sonnet-5"}
+    assert result["gpt-5.5"].total_calls == 2
 
 
 def test_model_queries_v2(v2_db: Path):
